@@ -192,10 +192,5 @@ Proyek ini merupakan implementasi **Event Aggregator Service** berbasis **FastAP
 
 ---
 
-## Link Demonsrasi (Youtube)
-
-```
-https://youtu.be/Se-6_at8shE
-```
 
 ---
