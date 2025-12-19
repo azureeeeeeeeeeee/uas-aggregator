@@ -1,29 +1,45 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
 from typing import List, Dict, Union
-from src.utils import Base, engine, db, setup_logger, get_db
+from src.utils import Base, engine, setup_logger, get_db
 from src.models.dedup_model import DedupEvent
-from src.models.schemas.dedup_schema import EventSchema
+from src.models.stats_model import Stats
+from src.services.processor import EventProcessor
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import distinct
+from sqlalchemy import distinct, text
 from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
 
+# Create tables
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
+logger = setup_logger()
+
+# Lifespan context to initialize stats
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Ensure stats row exists
+    with Session(engine) as db:
+        stats = db.query(Stats).first()
+        if not stats:
+            # Atomic initial insert if needed
+            try:
+                db.add(Stats(id=1, received=0, unique_processed=0, duplicate_dropped=0))
+                db.commit()
+                logger.info("Initialized Stats table.")
+            except Exception:
+                # Might happen if another worker initializes it concurrently
+                db.rollback()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 START_TIME = datetime.now(timezone.utc)
-STATS = {
-    "received": 0,
-    "unique_processed": 0,
-    "duplicate_dropped": 0,
-}
-
-logger = setup_logger()
 
 @app.get("/")
 def main():
     return {
-        "message": "Hello world fastapi"
+        "message": "Aggregator Service is Running",
+        "docs": "/docs"
     }
 
 @app.post("/publish")
@@ -31,7 +47,6 @@ async def publish_event(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    
     try:
         data = await request.json()
     except Exception:
@@ -44,79 +59,33 @@ async def publish_event(
     else:
         raise HTTPException(status_code=400, detail="Request body must be a JSON object or array")
 
-    # logger.info(f"Received {len(events_data)} event(s).")
-    logger.info(f"Server receive new data to be published")
-    STATS["received"] += len(events_data)
-
-    processed_ids = []
-    duplicates = 0
-
-    for raw_event in events_data:
-        try:
-            event = EventSchema(**raw_event)
-        except Exception as e:
-            logger.error(f"Invalid event data: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid event format: {e}")
-
-        logger.info(f"Processing event_id={event.event_id} from topic={event.topic}")
-
-        existing = db.query(DedupEvent).filter_by(
-            topic=event.topic,
-            event_id=event.event_id
-        ).first()
-
-        if existing:
-            logger.warning(f"Duplicate detected: event_id={event.event_id}")
-            STATS["duplicate_dropped"] += 1
-            duplicates += 1
-            continue
-
-        new_event = DedupEvent(
-            event_id=event.event_id,
-            topic=event.topic,
-            source=event.source,
-            timestamp=event.timestamp,
-            payload=event.payload
-        )
-        db.add(new_event)
-        processed_ids.append(event.event_id)
-
-    db.commit()
-
-    STATS["unique_processed"] += len(processed_ids)
-    logger.info(f"Processed {len(processed_ids)} new event(s), {duplicates} duplicate(s) dropped.")
-
-    return {
-        "status": "ok",
-        "processed": processed_ids,
-        "duplicates": duplicates,
-        "total_received": len(events_data)
-    }
+    processor = EventProcessor(db)
+    result = processor.process_batch(events_data)
+    
+    return result
 
 
 @app.get("/events")
-def get_events(topic):
-    logger.info("Server received a request to get all events data")
-    logger.info("Querying the desired data. . .")
+def get_events(topic: str = None, limit: int = 100, db: Session = Depends(get_db)):
     query = db.query(DedupEvent)
     if topic:
         query = query.filter_by(topic=topic)
+    
+    # Order by timestamp desc
+    events = query.order_by(DedupEvent.timestamp.desc()).limit(limit).all()
 
-    events = query.all()
-
-    if not events:
-        logger.warning(f"No events with topic {topic} is being found !!!")
+    if not events and topic:
+        # User requirement says: "Endpoint GET /events?topic=...: daftar event unik yang telah diproses."
+        # If no events for topic, returning empty list is often better than 404, but conforming to existing test expectation:
+        # test_get_events_not_found expects 404
         raise HTTPException(status_code=404, detail="No events found")
-
-    logger.info("Query is done. . .")
-    logger.info("Returning the data into the client. . .")
-
+        
     return [
         {
             "event_id": e.event_id,
             "topic": e.topic,
             "source": e.source,
-            "timestamp": e.timestamp.isoformat(),
+            "timestamp": e.timestamp.isoformat() if e.timestamp else None,
             "payload": e.payload
         }
         for e in events
@@ -125,15 +94,22 @@ def get_events(topic):
 
 @app.get("/stats")
 def get_stats(db: Session = Depends(get_db)):
-    logger.info("Server receive a request to get server status")
+    # Retrieve persistent stats
+    stats = db.query(Stats).filter(Stats.id == 1).first()
+    
+    # Calculate live topics count
+    # Note: large scale this is slow, but for requirements it works.
     topics = [row[0] for row in db.query(distinct(DedupEvent.topic)).all()]
+    
     uptime = datetime.now(timezone.utc) - START_TIME
-    logger.info("Returning all status data into client")
+    
+    if not stats:
+        return {"error": "Stats not initialized"}
 
     return {
-        "received": STATS["received"],
-        "unique_processed": STATS["unique_processed"],
-        "duplicate_dropped": STATS["duplicate_dropped"],
+        "received": stats.received,
+        "unique_processed": stats.unique_processed,
+        "duplicate_dropped": stats.duplicate_dropped,
         "topics": topics,
         "uptime": str(timedelta(seconds=int(uptime.total_seconds())))
     }
