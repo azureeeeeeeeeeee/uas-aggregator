@@ -1,4 +1,4 @@
-# 🧩 UTS Sistem Terdistribusi – Pub/Sub Aggregator
+# UAS Sistem Terdistribusi – Pub/Sub Aggregator
 
 Proyek ini merupakan implementasi **Event Aggregator Service** berbasis **FastAPI + asyncio**, yang berfungsi sebagai sistem **Pub/Sub sederhana** dengan fitur **deduplication, idempotency, dan event persistence**.  
 
